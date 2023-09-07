@@ -2,12 +2,12 @@ import torch
 from functools import reduce
 from torch.optim.optimizer import Optimizer
 from torch.autograd.functional import hvp
+from pdb import set_trace
 
 __all__ = ['ConjugateGradTR']
 
 class ConjugateGradTR(Optimizer):
-    """Implements L-BFGS algorithm, heavily inspired by `minFunc
-    <https://www.cs.ubc.ca/~schmidtm/Software/minFunc.html>`_.
+    """Implements Conjugate Gradient in a Trust-Region setting algorithm
 
     .. warning::
         This optimizer doesn't support per-parameter options and parameter
@@ -17,10 +17,8 @@ class ConjugateGradTR(Optimizer):
         Right now all parameters have to be on a single device. This will be
         improved in the future.
 
-    .. note::
-        This is a very memory intensive optimizer (it requires additional
-        ``param_bytes * (history_size + 1)`` bytes). If it doesn't fit in memory
-        try reducing the history size, or use a different algorithm.
+    For more information on the algorithm itself, please refer:
+    https://www.csie.ntu.edu.tw/~r97002/temp/num_optimization.pdf, Page 171 (CG-Steihaug)
 
     Args:
         lr (float): learning rate (default: 1)
@@ -39,22 +37,26 @@ class ConjugateGradTR(Optimizer):
     def __init__(self,
                  params,
                  lr=1,
-                 max_iter=20,
                  max_eval=None,
                  tolerance_grad=1e-7,
                  tolerance_change=1e-9,
-                 history_size=100,
-                 line_search_fn=None):
-        if max_eval is None:
-            max_eval = max_iter * 5 // 4
+                 line_search_fn=None,
+                 max_cg_iters = 10,
+                 max_tr_iters = 10,
+                 eta = 0.25,
+                 deltaCap = 1):
+
         defaults = dict(
             lr=lr,
-            max_iter=max_iter,
             max_eval=max_eval,
             tolerance_grad=tolerance_grad,
             tolerance_change=tolerance_change,
-            history_size=history_size,
-            line_search_fn=line_search_fn)
+            line_search_fn=line_search_fn,
+            max_cg_iters=max_cg_iters,
+            max_tr_iters=max_tr_iters,
+            deltaCap=deltaCap,
+            eta = eta,
+            deltatr= deltaCap)
         super().__init__(params, defaults)
 
         if len(self.param_groups) != 1:
@@ -80,6 +82,15 @@ class ConjugateGradTR(Optimizer):
                 view = p.grad.view(-1)
             views.append(view)
         return torch.cat(views, 0)
+    
+    def _flatten_params(self):
+        views = []
+        for p in self._params:
+            view = p.view(-1)
+            views.append(view)
+        
+        return torch.cat(views, 0)
+
 
     def _add_grad(self, step_size, update):
         offset = 0
@@ -95,7 +106,9 @@ class ConjugateGradTR(Optimizer):
 
     def _set_param(self, params_data):
         for p, pdata in zip(self._params, params_data):
-            p.copy_(pdata)
+            p.add_(pdata)
+
+
 
     def _directional_evaluate(self, closure, x, t, d):
         self._add_grad(t, d)
@@ -103,9 +116,11 @@ class ConjugateGradTR(Optimizer):
         flat_grad = self._gather_flat_grad()
         self._set_param(x)
         return loss, flat_grad
+    
+
 
     @torch.no_grad()
-    def step(self, closure):
+    def step(self, closure, model):
         """Performs a single optimization step.
 
         Args:
@@ -119,12 +134,15 @@ class ConjugateGradTR(Optimizer):
 
         group = self.param_groups[0]
         lr = group['lr']
-        max_iter = group['max_iter']
-        max_eval = group['max_eval']
+        max_cg_iters = group['max_cg_iters']
+        max_tr_iters = group['max_tr_iters']
+        
         tolerance_grad = group['tolerance_grad']
         tolerance_change = group['tolerance_change']
         line_search_fn = group['line_search_fn']
-        history_size = group['history_size']
+        deltaCap = group['deltaCap']
+        deltatr = group['deltatr']
+        eta = group['eta']
 
         # NOTE: ConjugateGradTR has only global state, but we register it as state for
         # the first param, because this helps with casting in load_state_dict
@@ -145,62 +163,81 @@ class ConjugateGradTR(Optimizer):
         if opt_cond:
             return orig_loss
 
-        # tensors cached in state (for tracing)
-        d = state.get('d')
-        t = state.get('t')
-        old_dirs = state.get('old_dirs')
-        old_stps = state.get('old_stps')
-        ro = state.get('ro')
-        H_diag = state.get('H_diag')
         prev_flat_grad = state.get('prev_flat_grad')
         prev_loss = state.get('prev_loss')
+        
+        '''
+            We initialize our values for 
+                z_0 = 0, 
+                r_0 = \nabla f_k, 
+                d_0 = -r_0 = -\nabla f_k 
+        
+        '''
 
         n_iter = 0
         epsilon = 1e-5
         # optimize for a max of max_iter iterations
-        d = flat_grad.neg()
-        if torch.norm(d) < epsilon:
-            return loss
-        
-        ############################################################
-        # compute the CG Steihaug using Trust-region
-        ############################################################
+        dj = flat_grad.neg()
         rj = flat_grad
-        z = 0
-        while n_iter < max_iter:
-            # Let's code the CG steihaug method here
-            n_iter += 1
-            state['n_iter'] += 1
-            Bd = hvp(closure, d)
-            if d.dot(Bd) <=0:
-                # set the value of \tau such that 
-                pass
-            d = flat_grad.neg()
-            Bd = hvp(closure,)
-            alpha = r.dot(r)/ d.dot(Bd)
-            z = z + alpha*d
-            rj1 = rj + alpha* Bd
-            if torch.norm(rj1)< epsilon:
-                return loss
-        
-            betaj1 = rj1.dot(rj1)/rj.dot(rj)
-            d = -rj1 + betaj1*d
 
+        # Also, we are only doing it for a finite number of steps.
+        tr_iterations = 0
 
+        z = torch.zeros(self._flatten_params().shape)
 
+        while tr_iterations< max_tr_iters:
+            while n_iter < max_tr_iters:
+                # Let's code the CG steihaug method here
+                # Refer page 171 in https://www.csie.ntu.edu.tw/~r97002/temp/num_optimization.pdf
+                n_iter += 1
+                state['n_iter'] += 1
+                set_trace()
+                _,Bdj = hvp(model,inputs=self._flatten_params(), v=dj, create_graph=False)
+                if dj.dot(Bdj) <=0:
+                    # set the value of \tau such that 
+                    # the value minimizes the loss along the direction of the last
+                    # iterate
+                    pass
+                alpha = rj.dot(rj)/ dj.dot(Bdj)
+                z = z + alpha*dj
+                rj1 = rj + alpha* Bdj
+                if torch.norm(rj1)< epsilon:
+                    break
             
+                betaj1 = rj1.dot(rj1)/rj.dot(rj)
+                dj = -rj1 + betaj1*dj
+                
             ############################################################
-            # compute step length
+            # compute the trust-region step
             ############################################################
             # reset initial guess for step size
+
+            _,Bz = hvp(model,inputs=self._flatten_params(), v=z, create_graph=False)
+            g = self._gather_flat_grad()
+            predDiff = g.dot(z) + 0.5*(z.dot(Bz))
+            loss0 = closure()
+            self._set_param(z)
+            loss1 = closure()
+            
+            TDiff = loss1 - loss0
+            rho = TDiff / predDiff
+            
+            if rho< 0.25:
+                deltatr = 0.25*deltatr
+            
+            else:
+                if rho > 0.75 and torch.norm(z) == delattr:
+                    deltatr = max(2*deltatr, deltaCap)
+
+            
+            if rho < eta:
+                self._set_param(-z)
+
 
             ############################################################
             # check conditions
             ############################################################
-            if n_iter == max_iter:
-                break
-
-            if current_evals >= max_eval:
+            if n_iter == max_tr_iters:
                 break
 
             # optimal condition
@@ -208,19 +245,11 @@ class ConjugateGradTR(Optimizer):
                 break
 
             # lack of progress
-            if d.mul(t).abs().max() <= tolerance_change:
-                break
-
             if abs(loss - prev_loss) < tolerance_change:
                 break
 
-        state['d'] = d
-        state['t'] = t
-        state['old_dirs'] = old_dirs
-        state['old_stps'] = old_stps
-        state['ro'] = ro
-        state['H_diag'] = H_diag
         state['prev_flat_grad'] = prev_flat_grad
         state['prev_loss'] = prev_loss
+        state['deltatr'] = deltatr
 
         return orig_loss

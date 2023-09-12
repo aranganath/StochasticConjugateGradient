@@ -108,6 +108,8 @@ class ConjugateGradTR(Optimizer):
         for p, pdata in zip(self._params, params_data):
             p.add_(pdata)
 
+        
+
 
 
     def _directional_evaluate(self, closure, x, t, d):
@@ -184,28 +186,56 @@ class ConjugateGradTR(Optimizer):
         tr_iterations = 0
 
         z = torch.zeros(self._flatten_params().shape)
+        cg_iters = 0
+        # We will only be doing a limited number of trust region iterations
 
+        
         while tr_iterations< max_tr_iters:
-            while n_iter < max_tr_iters:
-                # Let's code the CG steihaug method here
+
+            curr_grad = self._gather_flat_grad()
+            # and only a limited number of cg iterations
+            while cg_iters < max_cg_iters:
+
                 # Refer page 171 in https://www.csie.ntu.edu.tw/~r97002/temp/num_optimization.pdf
                 n_iter += 1
                 state['n_iter'] += 1
-                set_trace()
                 _,Bdj = hvp(model,inputs=self._flatten_params(), v=dj, create_graph=False)
                 if dj.dot(Bdj) <=0:
-                    # set the value of \tau such that 
-                    # the value minimizes the loss along the direction of the last
-                    # iterate
+                    
+                    
+
                     pass
                 alpha = rj.dot(rj)/ dj.dot(Bdj)
                 z = z + alpha*dj
+                if torch.norm(z+alpha*dj) > deltatr: 
+                    
+                    
+                    dj = alpha*dj
+                    tau1 = (-2*dj.dot(z) + torch.sqrt(4*(dj.dot(z))**2 - 4 *dj.dot(dj) * (z.dot(z)- deltatr**2)))/(2*dj.dot(dj))
+                    tau2  = (-2*dj.dot(z) - torch.sqrt(4*(dj.dot(z))**2 - 4 *dj.dot(dj) * (z.dot(z)- deltatr**2)))/(2*dj.dot(dj))
+                    set_trace()
+                    ztau1 = z + tau1*dj
+                    _,Bztau1 = hvp(model,inputs=self._flatten_params(), v=ztau1, create_graph=False)
+                    mtau1 = curr_grad.dot(ztau1) + 0.5*ztau1.dot(Bztau1)
+                    ztau2 = z + tau2*dj
+                    _,Bztau2 = hvp(model,inputs=self._flatten_params(), v=ztau2, create_graph=False)
+                    mtau2 = curr_grad.dot(ztau2) + 0.5*ztau2.dot(Bztau2)
+                    if mtau1 > mtau2:
+                        z = ztau2
+                        break
+                    else:
+                        z = ztau1
+                        break
+                    break
+                    
+
                 rj1 = rj + alpha* Bdj
                 if torch.norm(rj1)< epsilon:
-                    break
-            
+                    pass
+                    
                 betaj1 = rj1.dot(rj1)/rj.dot(rj)
                 dj = -rj1 + betaj1*dj
+                cg_iters += 1
                 
             ############################################################
             # compute the trust-region step
@@ -213,8 +243,7 @@ class ConjugateGradTR(Optimizer):
             # reset initial guess for step size
 
             _,Bz = hvp(model,inputs=self._flatten_params(), v=z, create_graph=False)
-            g = self._gather_flat_grad()
-            predDiff = g.dot(z) + 0.5*(z.dot(Bz))
+            predDiff = curr_grad.dot(z) + 0.5*(z.dot(Bz))
             loss0 = closure()
             self._set_param(z)
             loss1 = closure()
@@ -226,7 +255,7 @@ class ConjugateGradTR(Optimizer):
                 deltatr = 0.25*deltatr
             
             else:
-                if rho > 0.75 and torch.norm(z) == delattr:
+                if rho > 0.75 and torch.norm(z) == deltatr:
                     deltatr = max(2*deltatr, deltaCap)
 
             
@@ -237,16 +266,9 @@ class ConjugateGradTR(Optimizer):
             ############################################################
             # check conditions
             ############################################################
-            if n_iter == max_tr_iters:
-                break
 
-            # optimal condition
-            if opt_cond:
-                break
-
-            # lack of progress
-            if abs(loss - prev_loss) < tolerance_change:
-                break
+            tr_iterations += 1
+            cg_iters = 0 
 
         state['prev_flat_grad'] = prev_flat_grad
         state['prev_loss'] = prev_loss
